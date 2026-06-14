@@ -1,12 +1,17 @@
 import os
 import json
 import bcrypt
+import time
+from datetime import datetime
+from functools import wraps
+from collections import defaultdict
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 
 app = Flask(__name__, static_folder='.')
 CORS(app)
 
+# ===== FILES =====
 USERS_FILE = "users.json"
 NOTES_FILE = "notes.json"
 NEWS_FILE = "news.json"
@@ -14,6 +19,31 @@ GUIDES_FILE = "guides.json"
 SETTINGS_FILE = "settings.json"
 RESULTS_FILE = "results.json"
 TESTS_FILE = "tests.json"
+ANALYTICS_FILE = "analytics.json"
+NOTIFICATIONS_FILE = "notifications.json"
+
+# ===== RATE LIMITING =====
+request_counts = defaultdict(lambda: {"count": 0, "reset_time": time.time()})
+RATE_LIMIT_REQUESTS = 100
+RATE_LIMIT_WINDOW = 60
+
+
+def rate_limit(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        ip = request.remote_addr
+        current_time = time.time()
+        
+        if current_time > request_counts[ip]["reset_time"] + RATE_LIMIT_WINDOW:
+            request_counts[ip] = {"count": 0, "reset_time": current_time}
+        
+        request_counts[ip]["count"] += 1
+        
+        if request_counts[ip]["count"] > RATE_LIMIT_REQUESTS:
+            return jsonify({"error": "rate limit exceeded"}), 429
+        
+        return f(*args, **kwargs)
+    return decorated
 
 
 def load_json(path, default):
@@ -74,9 +104,11 @@ if not users:
 notes = load_json(NOTES_FILE, [])
 news = load_json(NEWS_FILE, [])
 guides = load_json(GUIDES_FILE, [])
-settings = load_json(SETTINGS_FILE, {"theme": "light"})
+settings = load_json(SETTINGS_FILE, {"theme": "light", "language": "ru"})
 tests = load_json(TESTS_FILE, [])
 results = load_json(RESULTS_FILE, [])
+analytics = load_json(ANALYTICS_FILE, {"version": "4.0.0", "stats": {}})
+notifications = load_json(NOTIFICATIONS_FILE, [])
 
 
 def check_admin_payload(payload):
@@ -90,6 +122,34 @@ def check_admin_payload(payload):
     return bool(u and check_password(admin_password, u.get("password")) and u.get("role") == "admin")
 
 
+def add_notification(user, title, message, type="info"):
+    notification = {
+        "user": user,
+        "title": title,
+        "message": message,
+        "type": type,
+        "timestamp": datetime.now().isoformat(),
+        "read": False
+    }
+    notifications.append(notification)
+    save_json(NOTIFICATIONS_FILE, notifications)
+    return notification
+
+
+def track_analytics(event_type, user, details=None):
+    if "events" not in analytics:
+        analytics["events"] = []
+    
+    event = {
+        "type": event_type,
+        "user": user,
+        "timestamp": datetime.now().isoformat(),
+        "details": details or {}
+    }
+    analytics["events"].append(event)
+    save_json(ANALYTICS_FILE, analytics)
+
+
 @app.route("/", defaults={"path": ""})
 @app.route("/<path:path>")
 def serve_frontend(path):
@@ -99,6 +159,7 @@ def serve_frontend(path):
 
 
 @app.post("/login")
+@rate_limit
 def login():
     data = request.json or {}
     login_username = data.get("login")
@@ -107,32 +168,64 @@ def login():
         return jsonify({"ok": False, "error": "login and password required"}), 400
     u = users.get(login_username)
     if not u or not check_password(login_password, u.get("password", "")):
+        track_analytics("login_failed", login_username)
         return jsonify({"ok": False, "error": "invalid credentials"}), 401
-    return jsonify({"ok": True, "role": u.get("role", "student")})
+    
+    track_analytics("login_success", login_username)
+    return jsonify({
+        "ok": True,
+        "role": u.get("role", "student"),
+        "version": "4.0.0"
+    })
+
+
+# ===== NOTIFICATIONS =====
+@app.get("/notifications/<username>")
+@rate_limit
+def get_notifications(username):
+    user_notifications = [n for n in notifications if n.get("user") == username]
+    return jsonify(user_notifications)
+
+
+@app.post("/notifications/read/<int:idx>")
+@rate_limit
+def mark_notification_read(idx):
+    if 0 <= idx < len(notifications):
+        notifications[idx]["read"] = True
+        save_json(NOTIFICATIONS_FILE, notifications)
+        return jsonify({"ok": True})
+    return jsonify({"error": "not found"}), 404
 
 
 # ===== NOTES (Materials) =====
 @app.get("/notes")
+@rate_limit
 def list_notes():
     return jsonify(notes)
 
 
 @app.post("/notes")
+@rate_limit
 def add_note():
     data = request.json or {}
+    user = data.get("user", "")
     note = {
         "title": data.get("title", ""),
         "desc": data.get("desc", ""),
-        "user": data.get("user", ""),
+        "user": user,
         "image": data.get("image", ""),
-        "assignedTo": data.get("assignedTo", "")
+        "assignedTo": data.get("assignedTo", ""),
+        "created_at": datetime.now().isoformat(),
+        "time_spent": 0
     }
     notes.append(note)
     save_json(NOTES_FILE, notes)
+    track_analytics("material_added", user, {"title": note["title"]})
     return jsonify({"ok": True})
 
 
 @app.post("/admin/notes/delete")
+@rate_limit
 def admin_delete_note():
     data = request.json or {}
     if not check_admin_payload(data):
@@ -145,12 +238,13 @@ def admin_delete_note():
         return jsonify({"error": "invalid index"}), 400
     notes.pop(idx)
     save_json(NOTES_FILE, notes)
+    track_analytics("material_deleted", data.get("admin_login"), {"index": idx})
     return jsonify({"ok": True})
 
 
 @app.post("/admin/materials/assign")
+@rate_limit
 def admin_assign_material():
-    """Переназначить материал пользователю (только админ)"""
     data = request.json or {}
     if not check_admin_payload(data):
         return jsonify({"error": "admin auth required"}), 403
@@ -166,12 +260,18 @@ def admin_assign_material():
     assigned_to = data.get("assigned_to", "")
     notes[idx]["assignedTo"] = assigned_to
     save_json(NOTES_FILE, notes)
+    track_analytics("material_assigned", data.get("admin_login"), {"to": assigned_to})
+    
+    if assigned_to:
+        add_notification(assigned_to, "Новый материал", 
+                        f"Вам назначен материал: {notes[idx].get('title', 'Без названия')}", "assignment")
+    
     return jsonify({"ok": True})
 
 
 @app.post("/admin/materials/edit")
+@rate_limit
 def admin_edit_material():
-    """Отредактировать материал (только админ)"""
     data = request.json or {}
     if not check_admin_payload(data):
         return jsonify({"error": "admin auth required"}), 403
@@ -192,12 +292,13 @@ def admin_edit_material():
         notes[idx]["image"] = data.get("image", "")
 
     save_json(NOTES_FILE, notes)
+    track_analytics("material_edited", data.get("admin_login"), {"index": idx})
     return jsonify({"ok": True})
 
 
 @app.post("/materials/edit")
+@rate_limit
 def edit_own_material():
-    """Ученик редактирует только свой материал"""
     data = request.json or {}
 
     username = data.get("username")
@@ -212,7 +313,6 @@ def edit_own_material():
     if idx < 0 or idx >= len(notes):
         return jsonify({"error": "invalid index"}), 400
 
-    # Проверяем, что это материал пользователя
     if notes[idx].get("user") != username:
         return jsonify({"error": "can only edit your own materials"}), 403
 
@@ -224,30 +324,37 @@ def edit_own_material():
         notes[idx]["image"] = data.get("image", "")
 
     save_json(NOTES_FILE, notes)
+    track_analytics("material_edited_self", username, {"index": idx})
     return jsonify({"ok": True})
 
 
 # ===== NEWS =====
 @app.get("/news")
+@rate_limit
 def list_news():
     return jsonify(news)
 
 
 @app.post("/news")
+@rate_limit
 def add_news():
     data = request.json or {}
+    user = data.get("user", "")
     news_item = {
         "title": data.get("title", ""),
         "desc": data.get("desc", ""),
-        "user": data.get("user", ""),
-        "image": data.get("image", "")
+        "user": user,
+        "image": data.get("image", ""),
+        "created_at": datetime.now().isoformat()
     }
     news.append(news_item)
     save_json(NEWS_FILE, news)
+    track_analytics("news_added", user, {"title": news_item["title"]})
     return jsonify({"ok": True})
 
 
 @app.post("/admin/news/delete")
+@rate_limit
 def admin_delete_news():
     data = request.json or {}
     if not check_admin_payload(data):
@@ -260,10 +367,12 @@ def admin_delete_news():
         return jsonify({"error": "invalid index"}), 400
     news.pop(idx)
     save_json(NEWS_FILE, news)
+    track_analytics("news_deleted", data.get("admin_login"), {"index": idx})
     return jsonify({"ok": True})
 
 
 @app.post("/admin/news/update")
+@rate_limit
 def admin_update_news():
     data = request.json or {}
     if not check_admin_payload(data):
@@ -281,30 +390,37 @@ def admin_update_news():
     if "image" in data:
         news[idx]["image"] = data.get("image", news[idx].get("image", ""))
     save_json(NEWS_FILE, news)
+    track_analytics("news_updated", data.get("admin_login"), {"index": idx})
     return jsonify({"ok": True})
 
 
 # ===== GUIDES =====
 @app.get("/guides")
+@rate_limit
 def list_guides():
     return jsonify(guides)
 
 
 @app.post("/guides")
+@rate_limit
 def add_guide():
     data = request.json or {}
+    user = data.get("user", "")
     guide = {
         "title": data.get("title", ""),
         "desc": data.get("desc", ""),
-        "user": data.get("user", ""),
-        "image": data.get("image", "")
+        "user": user,
+        "image": data.get("image", ""),
+        "created_at": datetime.now().isoformat()
     }
     guides.append(guide)
     save_json(GUIDES_FILE, guides)
+    track_analytics("guide_added", user, {"title": guide["title"]})
     return jsonify({"ok": True})
 
 
 @app.post("/admin/guides/delete")
+@rate_limit
 def admin_delete_guide():
     data = request.json or {}
     if not check_admin_payload(data):
@@ -317,10 +433,12 @@ def admin_delete_guide():
         return jsonify({"error": "invalid index"}), 400
     guides.pop(idx)
     save_json(GUIDES_FILE, guides)
+    track_analytics("guide_deleted", data.get("admin_login"), {"index": idx})
     return jsonify({"ok": True})
 
 
 @app.post("/admin/guides/update")
+@rate_limit
 def admin_update_guide():
     data = request.json or {}
     if not check_admin_payload(data):
@@ -338,11 +456,13 @@ def admin_update_guide():
     if "image" in data:
         guides[idx]["image"] = data.get("image", guides[idx].get("image", ""))
     save_json(GUIDES_FILE, guides)
+    track_analytics("guide_updated", data.get("admin_login"), {"index": idx})
     return jsonify({"ok": True})
 
 
 # ===== USERS =====
 @app.post("/admin/users/list")
+@rate_limit
 def admin_users_list():
     payload = request.json or {}
     if not check_admin_payload(payload):
@@ -351,6 +471,7 @@ def admin_users_list():
 
 
 @app.post("/admin/users/add_or_update")
+@rate_limit
 def admin_users_add_update():
     data = request.json or {}
     if not check_admin_payload(data):
@@ -368,10 +489,12 @@ def admin_users_add_update():
         else:
             return jsonify({"error": "password required for new user"}), 400
     save_json(USERS_FILE, users)
+    track_analytics("user_updated", data.get("admin_login"), {"user": login})
     return jsonify({"ok": True})
 
 
 @app.post("/admin/users/delete")
+@rate_limit
 def admin_users_delete():
     data = request.json or {}
     if not check_admin_payload(data):
@@ -385,16 +508,19 @@ def admin_users_delete():
             return jsonify({"error": "cannot delete the last admin"}), 400
     users.pop(login, None)
     save_json(USERS_FILE, users)
+    track_analytics("user_deleted", data.get("admin_login"), {"user": login})
     return jsonify({"ok": True})
 
 
 # ===== SETTINGS =====
 @app.get("/admin/settings/theme")
+@rate_limit
 def get_theme():
     return jsonify(settings)
 
 
 @app.post("/admin/settings/theme")
+@rate_limit
 def set_theme():
     data = request.json or {}
     if not check_admin_payload(data):
@@ -404,11 +530,13 @@ def set_theme():
         return jsonify({"error": "invalid theme"}), 400
     settings["theme"] = theme
     save_json(SETTINGS_FILE, settings)
+    track_analytics("theme_changed", data.get("admin_login"), {"theme": theme})
     return jsonify({"ok": True})
 
 
 # ===== TESTS =====
 @app.get("/tests")
+@rate_limit
 def get_tests_public():
     safe = []
     for t in tests:
@@ -456,11 +584,14 @@ def get_tests_public():
 
 
 @app.post("/tests/submit")
+@rate_limit
 def submit_test():
     data = request.json or {}
     test_id = data.get('test_id')
     answers = data.get('answers', [])
     user = data.get('user', 'unknown')
+    time_spent = data.get('time_spent', 0)
+    
     t = next((x for x in tests if x.get('id') == test_id), None)
     if not t:
         return jsonify({'error': 'test not found'}), 404
@@ -494,20 +625,27 @@ def submit_test():
             'correct_answer': correct_answers
         })
 
+    percentage = round((correct / len(t.get('questions', []))) * 100) if len(t.get('questions', [])) > 0 else 0
+    
     score = {
         'user': user,
         'test_id': test_id,
         'score': correct,
         'total': len(t.get('questions', [])),
-        'percentage': round((correct / len(t.get('questions', []))) * 100) if len(t.get('questions', [])) > 0 else 0,
-        'details': details
+        'percentage': percentage,
+        'details': details,
+        'time_spent': time_spent,
+        'completed_at': datetime.now().isoformat()
     }
     results.append(score)
     save_json(RESULTS_FILE, results)
+    track_analytics("test_submitted", user, {"test_id": test_id, "score": percentage})
+    
     return jsonify(score)
 
 
 @app.post("/admin/tests/list")
+@rate_limit
 def admin_tests_list():
     data = request.json or {}
     if not check_admin_payload(data):
@@ -516,6 +654,7 @@ def admin_tests_list():
 
 
 @app.post("/admin/tests/add_or_update")
+@rate_limit
 def admin_tests_add_update():
     data = request.json or {}
     if not check_admin_payload(data):
@@ -534,10 +673,12 @@ def admin_tests_add_update():
         else:
             tests.append(test)
     save_json(TESTS_FILE, tests)
+    track_analytics("test_updated", data.get("admin_login"), {"test_id": test.get('id')})
     return jsonify({'ok': True, 'id': test['id']})
 
 
 @app.post("/admin/tests/delete")
+@rate_limit
 def admin_tests_delete():
     data = request.json or {}
     if not check_admin_payload(data):
@@ -547,11 +688,13 @@ def admin_tests_delete():
         if t.get('id') == tid:
             tests.pop(i)
             save_json(TESTS_FILE, tests)
+            track_analytics("test_deleted", data.get("admin_login"), {"test_id": tid})
             return jsonify({'ok': True})
     return jsonify({'error': 'not found'}), 404
 
 
 @app.post("/admin/results")
+@rate_limit
 def admin_results():
     data = request.json or {}
     if not check_admin_payload(data):
@@ -559,6 +702,46 @@ def admin_results():
     return jsonify(results)
 
 
+# ===== ANALYTICS & STATISTICS =====
+@app.post("/admin/analytics/stats")
+@rate_limit
+def get_analytics():
+    data = request.json or {}
+    if not check_admin_payload(data):
+        return jsonify({"error": "admin auth required"}), 403
+    
+    user_count = len(users)
+    test_count = len(tests)
+    completed_tests = len(results)
+    avg_score = round(sum([r.get('percentage', 0) for r in results]) / len(results)) if results else 0
+    
+    stats = {
+        "version": "4.0.0",
+        "users": user_count,
+        "tests": test_count,
+        "completed_tests": completed_tests,
+        "average_score": avg_score,
+        "materials": len(notes),
+        "news": len(news),
+        "guides": len(guides),
+        "events_count": len(analytics.get("events", []))
+    }
+    
+    return jsonify(stats)
+
+
+@app.post("/admin/analytics/events")
+@rate_limit
+def get_events():
+    data = request.json or {}
+    if not check_admin_payload(data):
+        return jsonify({"error": "admin auth required"}), 403
+    
+    limit = data.get("limit", 50)
+    events = analytics.get("events", [])[-limit:]
+    return jsonify(events)
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
