@@ -1,3 +1,14 @@
 {
-  "theme": "light"
+  "theme": "light",
+  "language": "ru",
+  "version": "4.0.0",
+  "features": {
+    "notifications": true,
+    "analytics": true,
+    "rate_limiting": true,
+    "dark_mode": true
+  },
+  "session_timeout": 3600,
+  "max_upload_size": 5242880,
+  "enable_notifications": true
 }
